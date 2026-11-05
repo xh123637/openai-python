@@ -108,6 +108,10 @@ def transform(
 
     It should be noted that the transformations that this function does are not represented in the type system.
     """
+    fast_path = _fast_path_transform(data, expected_type)
+    if fast_path is not _NO_FAST_PATH:
+        return cast(_T, fast_path)
+
     transformed = _transform_recursive(data, annotation=cast(type, expected_type))
     return cast(_T, transformed)
 
@@ -126,6 +130,111 @@ def _get_annotated_type(type_: type) -> type | None:
         return type_
 
     return None
+
+
+_NO_FAST_PATH = object()
+
+
+@lru_cache(maxsize=8096)
+def _type_contains_property_info(type_: type) -> bool:
+    """Whether the annotation tree of the given type contains any `PropertyInfo` metadata.
+
+    The result is cached, as walking the annotations of large types (for example,
+    `ResponseCreateParams`) involves hundreds of types.
+    """
+    return _contains_property_info(type_, set())
+
+
+def _contains_property_info(type_: object, seen: set[int]) -> bool:
+    if id(type_) in seen:
+        return False
+    seen.add(id(type_))
+
+    for arg in get_args(type_):
+        if isinstance(arg, PropertyInfo):
+            return True
+        if _contains_property_info(arg, seen):
+            return True
+
+    if isinstance(type_, type) and is_typeddict(type_):
+        try:
+            hints = get_type_hints(type_, include_extras=True)
+        except Exception:
+            # If the annotations cannot be resolved, assume a transform may be needed.
+            return True
+        for field_type in hints.values():
+            if _contains_property_info(field_type, seen):
+                return True
+
+    return False
+
+
+@lru_cache(maxsize=8096)
+def _top_level_is_typeddict(type_: type) -> bool:
+    """Whether the given type is, or (for unions) contains, a `TypedDict` at the top level."""
+    stripped = strip_annotated_type(type_)
+    if is_typeddict(stripped):
+        return True
+    if is_union_type(stripped):
+        return any(_top_level_is_typeddict(arg) for arg in get_args(stripped))
+    return False
+
+
+def _is_plain_json_data(data: object) -> bool:
+    """Whether `data` is made up only of plain JSON-like values.
+
+    Only `dict`, `list`, `str`, `int`, `float`, `bool` and `None` are allowed. Anything else
+    (pydantic models, `NotGiven`/`Omit` sentinels, tuples, dates, file inputs, ...) means the
+    full transform may change the data, so the fast path must not be taken.
+    """
+    stack: list[object] = [data]
+    while stack:
+        item = stack.pop()
+        item_type = type(item)
+        if item_type is dict:
+            stack.extend(cast("dict[str, object]", item).values())
+        elif item_type is list:
+            stack.extend(cast("list[object]", item))
+        elif item_type is str or item_type is int or item_type is float or item_type is bool or item is None:
+            continue
+        else:
+            return False
+    return True
+
+
+def _fast_path_transform(data: object, expected_type: object) -> object:
+    """Return `data` unchanged when the full transform is guaranteed to be a no-op for it.
+
+    This is only the case when the expected type's annotation tree contains no `PropertyInfo`
+    (so no keys are renamed and no values are reformatted) and the data itself is plain
+    JSON-like values (so the transform cannot dump a pydantic model, convert an iterable
+    to a list, or drop a `NotGiven`/`Omit` value nested inside the data).
+
+    `NotGiven`/`Omit` values at the top level of a mapping are stripped, mirroring what
+    `_transform_typeddict` would do for them.
+
+    Returns `_NO_FAST_PATH` when the fast path does not apply and the caller should run
+    the full transform instead.
+    """
+    try:
+        if _type_contains_property_info(cast(type, expected_type)):
+            return _NO_FAST_PATH
+        top_level_typeddict = _top_level_is_typeddict(cast(type, expected_type))
+    except TypeError:
+        # Unhashable expected type; fall back to the full transform.
+        return _NO_FAST_PATH
+
+    if is_mapping(data):
+        if top_level_typeddict and any(not is_given(value) for value in data.values()):
+            # `_transform_typeddict` drops top-level keys whose values are not given.
+            data = {key: value for key, value in data.items() if is_given(value)}
+        if _is_plain_json_data(data):
+            return data
+        return _NO_FAST_PATH
+
+    if _is_plain_json_data(data):
+        return data
+    return _NO_FAST_PATH
 
 
 def _maybe_transform_key(key: str, type_: type) -> str:
@@ -315,6 +424,10 @@ async def async_transform(
 
     It should be noted that the transformations that this function does are not represented in the type system.
     """
+    fast_path = _fast_path_transform(data, expected_type)
+    if fast_path is not _NO_FAST_PATH:
+        return cast(_T, fast_path)
+
     transformed = await _async_transform_recursive(data, annotation=cast(type, expected_type))
     return cast(_T, transformed)
 

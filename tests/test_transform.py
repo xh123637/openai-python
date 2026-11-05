@@ -17,6 +17,7 @@ from openai._utils import (
 )
 from openai._compat import PYDANTIC_V1
 from openai._models import BaseModel
+from openai.types.responses import response_create_params
 
 _T = TypeVar("_T")
 
@@ -524,3 +525,65 @@ async def test_not_required_transforms(use_async: bool) -> None:
     assert await transform({"items": [{"this_thing": 1}]}, DateDictWithNotRequiredAlias, use_async) == {
         "items": [{"this__thing": 1}]
     }
+
+
+class NoPropertyInfoNested(TypedDict, total=False):
+    label: str
+    value: int
+
+
+class NoPropertyInfoDict(TypedDict, total=False):
+    name: str
+    count: int
+    tags: List[str]
+    nested: NoPropertyInfoNested
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_no_property_info_passthrough(use_async: bool) -> None:
+    # When no `PropertyInfo` is present anywhere in the expected type, the transform is
+    # a no-op for plain data, so the data is returned unchanged instead of being walked.
+    data = {"name": "x", "count": 2, "tags": ["a", "b"], "nested": {"label": "l", "value": 3}}
+    result = await transform(data, NoPropertyInfoDict, use_async)
+    assert result == data
+    assert result is data
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_no_property_info_strips_top_level_not_given(use_async: bool) -> None:
+    assert await transform({"name": "x", "count": omit}, NoPropertyInfoDict, use_async) == {"name": "x"}
+    assert await transform({"name": "x", "count": not_given}, NoPropertyInfoDict, use_async) == {"name": "x"}
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_no_property_info_strips_nested_not_given(use_async: bool) -> None:
+    assert await transform({"nested": {"label": "l", "value": omit}}, NoPropertyInfoDict, use_async) == {
+        "nested": {"label": "l"}
+    }
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_no_property_info_still_dumps_nested_model(use_async: bool) -> None:
+    assert cast(Any, await transform({"nested": MyModel(foo="hi!")}, NoPropertyInfoDict, use_async)) == {
+        "nested": {"foo": "hi!"}
+    }
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_response_create_params_passthrough(use_async: bool) -> None:
+    # Regression test for https://github.com/openai/openai-python/issues/4021 — transforming
+    # a plain Responses request body must return it unchanged (and without walking it).
+    body = {
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}],
+        "stream": True,
+    }
+    result = await transform(body, response_create_params.ResponseCreateParamsStreaming, use_async)
+    assert result == body
+    assert result is body

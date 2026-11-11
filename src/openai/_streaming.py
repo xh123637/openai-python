@@ -162,18 +162,28 @@ class AsyncStream(Generic[_T]):
     async def __anext__(self) -> _T:
         return await self._iterator.__anext__()
 
-    async def __aiter__(self) -> AsyncIterator[_T]:
-        async for item in self._iterator:
-            yield item
+    def __aiter__(self) -> Self:
+        return self
 
     async def _iter_events(self) -> AsyncIterator[ServerSentEvent]:
+        body = self.response.aiter_bytes()
+        events = self._decoder.aiter_bytes(body)
         try:
-            async for sse in self._decoder.aiter_bytes(self.response.aiter_bytes()):
+            async for sse in events:
                 yield sse
         except timeout_exceptions() as err:
             raise APITimeoutError(request=self.response.request) from err
         except request_exceptions() as err:
             raise APIConnectionError(request=self.response.request) from err
+        finally:
+            # Close what this iterator opened, innermost first, before the
+            # response they read from is released.
+            try:
+                if (aclose := getattr(events, "aclose", None)) is not None:
+                    await aclose()
+            finally:
+                if (aclose := getattr(body, "aclose", None)) is not None:
+                    await aclose()
 
     async def __stream__(self) -> AsyncIterator[_T]:
         cast_to = cast(Any, self._cast_to)
@@ -234,6 +244,9 @@ class AsyncStream(Generic[_T]):
                         response=response,
                     )
         finally:
+            # Close the event iterator first, so the decoder and the byte
+            # iterator are released before the response they read from.
+            await iterator.aclose()
             # Ensure the response is closed even if the consumer doesn't read all data
             await response.aclose()
 
@@ -254,7 +267,10 @@ class AsyncStream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        await self.response.aclose()
+        try:
+            await self._iterator.aclose()
+        finally:
+            await self.response.aclose()
 
     async def aclose(self) -> None:
         """Close the response and release the connection. Alias for `close()`."""

@@ -17,7 +17,7 @@ import httpx2
 import pytest
 
 from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIConnectionError, DefaultAioHttpClient
-from openai._streaming import Stream, AsyncStream, ServerSentEvent
+from openai._streaming import Stream, AsyncStream, ServerSentEvent, SSEDecoder
 
 
 @pytest.fixture(
@@ -553,6 +553,61 @@ async def test_async_stream_aclose(async_client: AsyncOpenAI) -> None:
     # Either spelling remains safe after the response has already been closed.
     await stream.close()
     await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_async_stream_early_break_closes_iterators_before_response(
+    async_client: AsyncOpenAI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaking out of a stream closes the decoder and byte iterators first.
+
+    The iterators the stream opened must be released before the response they
+    read from, instead of being left suspended for the garbage collector.
+    """
+    closed: list[str] = []
+
+    class TrackingDecoder(SSEDecoder):
+        async def aiter_bytes(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[ServerSentEvent]:
+            try:
+                async for event in super().aiter_bytes(iterator):
+                    yield event
+            finally:
+                closed.append("decoder")
+
+    monkeypatch.setattr(async_client, "_make_sse_decoder", lambda: TrackingDecoder())
+
+    def body() -> Iterator[bytes]:
+        yield b'data: {"x":1}\n\n'
+        yield b'data: {"x":2}\n\n'
+
+    response = httpx2.Response(200, content=to_aiter(body()))
+    body_iterators: list[Any] = []
+    original_aiter_bytes = response.aiter_bytes
+
+    def tracking_aiter_bytes(*args: Any, **kwargs: Any) -> AsyncIterator[bytes]:
+        iterator = original_aiter_bytes(*args, **kwargs)
+        body_iterators.append(iterator)
+        return iterator
+
+    response.aiter_bytes = tracking_aiter_bytes  # type: ignore[method-assign]
+    original_aclose = response.aclose
+
+    async def tracking_aclose() -> None:
+        closed.append("response")
+        await original_aclose()
+
+    response.aclose = tracking_aclose  # type: ignore[method-assign]
+
+    stream = AsyncStream(cast_to=object, client=async_client, response=response)
+    async with aclosing(stream):
+        async for _chunk in stream:
+            break
+
+    assert closed == ["decoder", "response"]
+    assert response.is_closed
+    assert len(body_iterators) == 1
+    # A closed async generator no longer has a frame.
+    assert body_iterators[0].ag_frame is None
 
 
 @pytest.mark.asyncio

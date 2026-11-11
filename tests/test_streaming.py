@@ -17,7 +17,7 @@ import httpx2
 import pytest
 
 from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIConnectionError, DefaultAioHttpClient
-from openai._streaming import Stream, AsyncStream, ServerSentEvent, SSEDecoder
+from openai._streaming import Stream, SSEDecoder, AsyncStream, ServerSentEvent
 
 
 @pytest.fixture(
@@ -603,7 +603,11 @@ async def test_async_stream_early_break_closes_iterators_before_response(
         async for _chunk in stream:
             break
 
-    assert closed == ["decoder", "response"]
+    # The decoder is closed before the response; closing the byte iterator
+    # can itself close the response (httpx2's `aiter_raw` does), and closing
+    # the response is idempotent, so the response may be closed more than once.
+    assert closed[0] == "decoder"
+    assert len(closed) > 1 and all(entry == "response" for entry in closed[1:])
     assert response.is_closed
     assert len(body_iterators) == 1
     # A closed async generator no longer has a frame.
